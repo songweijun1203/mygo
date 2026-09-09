@@ -16,15 +16,20 @@ func main() {
 
 	done := make(chan struct{})
 	co.Create("counter", func(me coroutine.Thread) int {
-		for i := 1; i <= 3; i++ {
-			fmt.Printf("第 %d 帧: 协程正在运行\n", i)
-			co.WaitNextFrame()
-		}
+		//for i := 1; i <= 3; i++ {
+		fmt.Printf("第 %d 帧: 协程正在运行\n", 1)
+		co.WaitNextFrame()
+		fmt.Printf("第 %d 帧: 协程正在运行\n", 2)
+		co.WaitNextFrame()
+		fmt.Printf("第 %d 帧: 协程正在运行\n", 3)
+		co.WaitNextFrame()
+		//}
 		close(done)
 		return 0
 	})
 
 	for {
+		fmt.Println("ready update")
 		co.Update()
 		select {
 		case <-done:
