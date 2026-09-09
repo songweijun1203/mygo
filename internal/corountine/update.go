@@ -1,0 +1,212 @@
+/*
+ * Copyright (c) 2021 The XGo Authors (xgo.dev). All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package coroutine
+
+import (
+	"log"
+	sdebug "runtime/debug"
+	stime "time"
+)
+
+type updateState struct {
+	frame            int64
+	levelTime        float64
+	watchdogDeadline stime.Time
+	workDeadline     stime.Time
+}
+
+type updateAction uint8
+
+const (
+	updateProcessJob updateAction = iota
+	updateRetry
+	updateComplete
+	updateAwaitInitialization
+
+	updateWatchdogTimeout = stime.Second
+)
+
+// Update processes queued wait jobs and resumes eligible coroutines.
+func (p *Coroutines) Update() {
+	start := stime.Now()
+	gcStatsBefore := p.readGCStatsBeforeUpdate()
+
+	stats, state := p.beginUpdate()
+	stats.GCStatsEnabled = gcStatsBefore != nil
+	p.runUpdateLoop(&stats, &state)
+	p.finishUpdate(&stats, start, gcStatsBefore)
+	p.statsMu.Lock()
+	p.lastUpdateStats = stats
+	p.statsMu.Unlock()
+}
+
+func (p *Coroutines) readGCStatsBeforeUpdate() *sdebug.GCStats {
+	if !p.perfDebug.Load() {
+		return nil
+	}
+	stats := &sdebug.GCStats{}
+	p.readGCStats(stats)
+	return stats
+}
+
+func (p *Coroutines) beginUpdate() (UpdateJobsStats, updateState) {
+	start := stime.Now()
+	state := updateState{
+		frame:            Frame(),
+		levelTime:        TimeSinceLevelLoad(),
+		watchdogDeadline: p.updateWatchdogNow().Add(updateWatchdogTimeout),
+		workDeadline:     start.Add(loopWorkBudget),
+	}
+	return UpdateJobsStats{InitTime: elapsedMillis(start)}, state
+}
+
+func (p *Coroutines) runUpdateLoop(stats *UpdateJobsStats, state *updateState) {
+	start := stime.Now()
+	iterations := 0
+
+updateLoop:
+	for {
+		iterations++
+		switch p.nextUpdateAction(stats) {
+		case updateComplete:
+			if p.queueNextLoopRound(state) {
+				continue
+			}
+			break updateLoop
+		case updateAwaitInitialization:
+			state.watchdogDeadline = p.updateWatchdogNow().Add(updateWatchdogTimeout)
+			continue
+		case updateProcessJob:
+			p.processNextWaitJob(state, stats)
+		case updateRetry:
+		}
+
+		if !p.updateWatchdogNow().Before(state.watchdogDeadline) {
+			// A slow frame is not necessarily a runaway script. Leave queued work
+			// for the next Update without canceling scripts or waiting for cleanup.
+			log.Printf("coroutine: update exceeded 1 second; deferring remaining work (waitMainCount=%d)", stats.WaitMainCount)
+			break updateLoop
+		}
+	}
+
+	stats.LoopTime = elapsedMillis(start)
+	stats.LoopIterations = iterations
+	p.promoteDeferredJobs(stats)
+}
+
+func (p *Coroutines) nextUpdateAction(stats *UpdateJobsStats) updateAction {
+	if !p.hasInited.Load() {
+		if p.currentJobs.Count() == 0 {
+			start := stime.Now()
+			Sleep(0.05)
+			stats.WaitTime += elapsedMillis(start)
+			return updateAwaitInitialization
+		}
+		return updateProcessJob
+	}
+
+	start := stime.Now()
+	action := updateProcessJob
+	p.schedulerMu.Lock()
+	if p.currentJobs.Count() == 0 {
+		if p.runnableThreadCountLocked() == 0 {
+			action = updateComplete
+		} else {
+			p.schedulerCond.Wait()
+			action = updateRetry
+		}
+	}
+	p.schedulerMu.Unlock()
+	stats.WaitTime += elapsedMillis(start)
+	return action
+}
+
+func (p *Coroutines) processNextWaitJob(state *updateState, stats *UpdateJobsStats) {
+	start := stime.Now()
+	job := p.currentJobs.PopFront()
+	stats.TaskCounts++
+	p.processWaitJob(state, stats, job)
+	stats.TaskProcessing += elapsedMillis(start)
+}
+
+func (p *Coroutines) processWaitJob(state *updateState, stats *UpdateJobsStats, job *WaitJob) {
+	if job.Th != nil && p.isThreadCanceled(job.Th) {
+		return
+	}
+
+	switch job.Type {
+	case waitTypeLoop:
+		if job.Frame < state.frame {
+			p.runWaitJob(job)
+		} else {
+			p.loopJobs.PushBack(job)
+		}
+	case waitTypeFrame:
+		if job.Frame >= state.frame {
+			p.deferredJobs.PushBack(job)
+		} else {
+			p.runWaitJob(job)
+			stats.WaitFrameCount++
+		}
+	case waitTypeTime:
+		if job.Time >= state.levelTime {
+			p.deferredJobs.PushBack(job)
+		} else {
+			p.runWaitJob(job)
+		}
+	case waitTypeYield:
+		p.runWaitJob(job)
+	case waitTypeMainThread:
+		job.Call()
+		stats.WaitMainCount++
+	}
+}
+
+func (p *Coroutines) runWaitJob(job *WaitJob) {
+	if job.Call != nil {
+		job.Call()
+	} else {
+		p.markRunnableAndResume(job.Th)
+	}
+}
+
+func (p *Coroutines) promoteDeferredJobs(stats *UpdateJobsStats) {
+	start := stime.Now()
+	p.deferredJobs.Move(p.loopJobs)
+	stats.NextCount = p.deferredJobs.Count()
+	p.currentJobs.Move(p.deferredJobs)
+	stats.MoveTime = elapsedMillis(start)
+}
+
+func (p *Coroutines) finishUpdate(stats *UpdateJobsStats, start stime.Time, before *sdebug.GCStats) {
+	if before != nil {
+		var after sdebug.GCStats
+		p.readGCStats(&after)
+		stats.GCCount = int(after.NumGC - before.NumGC)
+		stats.GCPauses = float64(after.PauseTotal-before.PauseTotal) / float64(stime.Millisecond)
+	}
+
+	total := elapsedMillis(start)
+	accounted := stats.InitTime + stats.LoopTime + stats.MoveTime
+	stats.TotalTime = total
+	stats.ExternalTime = total - accounted
+	stats.TimeDifference = total - accounted
+}
+
+func elapsedMillis(start stime.Time) float64 {
+	return stime.Since(start).Seconds() * 1000
+}
