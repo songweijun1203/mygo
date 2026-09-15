@@ -6,7 +6,7 @@
       "type": "go",
       "request": "launch",
       "mode": "debug",
-      "program": "${workspaceFolder}/cmd/mygo",
+      "program": "${workspaceFolder}/cmd/stage1",
       "cwd": "${workspaceFolder}",
       "stopOnEntry": true
     },
