@@ -9,15 +9,15 @@ import (
 
 func main() {
 	scheduler := learncoroutine.New()
-	count := 0
 
 	scheduler.Spawn(func(ctx learncoroutine.Context) learncoroutine.StepResult {
-		count++
-		fmt.Printf("frame=%d, step=%d\n", ctx.Frame, count)
-		if count == 3 {
-			return learncoroutine.Complete()
-		}
-		return learncoroutine.WaitFrames(1)
+		fmt.Println("A", ctx.Frame)
+		return learncoroutine.WaitFrames(5)
+	})
+
+	scheduler.Spawn(func(ctx learncoroutine.Context) learncoroutine.StepResult {
+		fmt.Println("B", ctx.Frame)
+		return learncoroutine.Complete()
 	})
 
 	for scheduler.Pending() > 0 {
