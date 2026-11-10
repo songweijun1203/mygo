@@ -1,0 +1,29 @@
+name: Go 自动测试
+
+on:
+  push:           # 每次 push 代码触发
+  workflow_dispatch: # 允许你在网页上手动点击运行
+
+jobs:
+  test:
+    runs-on: ubuntu-latest # 用最新版 Ubuntu 服务器
+
+    steps:
+      # 1. 拉取你的代码
+      - name: 拉取代码
+        uses: actions/checkout@v4
+
+      # 2. 安装 Go 环境
+      - name: 安装 Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: 'go.mod' # 自动读取你 go.mod 里的 Go 版本
+          cache: true               # 开启依赖缓存，让后续运行变快
+
+      # 3. 下载依赖 (如果你 go.mod 里有第三方库)
+      - name: 下载依赖
+        run: go mod download
+
+      # 4. 跑测试
+      - name: 执行测试
+        run: go test ./... -v     # -v 表示输出详细信息

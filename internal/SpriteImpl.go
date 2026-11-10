@@ -6,9 +6,9 @@ type SpriteImpl struct {
 }
 
 func (s *SpriteImpl) GetName() string {
-	return name
+	return s.name
 }
 
-func (s *SpriteImpl) SetName(n string)  {
-	return name = n;
+func (s *SpriteImpl) SetName(n string) {
+	s.name = n
 }
